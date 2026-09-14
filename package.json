@@ -8,6 +8,7 @@
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview",
+    "biw": "npm run build && vite preview --host 127.0.0.1 --port 5174 --strictPort",
     "test": "node --test"
   },
   "dependencies": {

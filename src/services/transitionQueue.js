@@ -12,7 +12,11 @@ export const createTransitionQueue = (limit = 2) => {
       } else index++;
     }
     while (active < limit) {
-      const index = pending.findIndex((job) => job.ready());
+      let index = -1;
+      for (let candidate = 0; candidate < pending.length; candidate++) {
+        if (pending[candidate].ready() &&
+            (index < 0 || pending[candidate].priority > pending[index].priority)) index = candidate;
+      }
       if (index < 0) break;
       const [job] = pending.splice(index, 1);
       active++;
@@ -23,8 +27,8 @@ export const createTransitionQueue = (limit = 2) => {
     }
     if (pending.length) timer = setTimeout(pump, 50);
   };
-  return (task, { ready = () => true, signal } = {}) => new Promise((resolve, reject) => {
-    pending.push({ task, ready, signal, resolve, reject });
+  return (task, { ready = () => true, signal, priority = 0 } = {}) => new Promise((resolve, reject) => {
+    pending.push({ task, ready, signal, priority, resolve, reject });
     pump();
   });
 };

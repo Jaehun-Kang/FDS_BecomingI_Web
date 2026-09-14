@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { bridgeClient } from "../services/bridgeClient.js";
 import { extensionClient } from "../services/extensionClient.js";
 import { sessionStore } from "../services/sessionStore.js";
+import { getCaptureCountdownVisual } from "../services/captureCountdown.js";
 
 const kioskInstanceId = "invidigram-windows-dev";
 const staleCaptureStates = new Set(["CAPTURING", "RECOVERY_REQUIRED"]);
@@ -31,7 +32,8 @@ const shouldReplaceForNewProfileSetup = (session) =>
 
 const formatCaptureStatusMessage = (status) => {
   const step =
-    status.step ?? Math.min(status.completedSlots.length + 1, captureTotalSteps);
+    status.step ??
+    Math.min(status.completedSlots.length + 1, captureTotalSteps);
   const totalSteps = status.totalSteps ?? captureTotalSteps;
   const instruction = status.instruction || "정면을 바라봐주세요";
 
@@ -53,8 +55,31 @@ export const useProfileSession = () => {
   const [statusMessage, setStatusMessage] = useState("Bridge 연결 확인 중");
   const [isBusy, setIsBusy] = useState(true);
   const [isBridgeReady, setIsBridgeReady] = useState(false);
-  const [captureCountdown, setCaptureCountdown] = useState(null);
+  const [captureCountdown, updateCaptureCountdown] = useState(null);
+  const [countdownDeadline, setCountdownDeadline] = useState(null);
+  const [captureFlashId, setCaptureFlashId] = useState(0);
+  const [captureProgress, setCaptureProgress] = useState(null);
+  const setCaptureCountdown = (value) => {
+    setCountdownDeadline(null);
+    setCaptureProgress(null);
+    updateCaptureCountdown(value);
+  };
   const pollTimer = useRef(null);
+
+  useEffect(() => {
+    if (countdownDeadline === null) return undefined;
+    const update = () => {
+      const { countdown, progress } = getCaptureCountdownVisual(
+        countdownDeadline,
+        Date.now(),
+      );
+      updateCaptureCountdown(countdown);
+      setCaptureProgress(progress);
+    };
+    update();
+    const timer = setInterval(update, 50);
+    return () => clearInterval(timer);
+  }, [countdownDeadline]);
 
   useEffect(() => {
     let cancelled = false;
@@ -96,7 +121,10 @@ export const useProfileSession = () => {
               sessionStore.save(current);
             }
           } catch (error) {
-            logSessionError("Stored profile session could not be restored", error);
+            logSessionError(
+              "Stored profile session could not be restored",
+              error,
+            );
             sessionStore.clear();
           }
         }
@@ -104,9 +132,7 @@ export const useProfileSession = () => {
         if (!cancelled) {
           setSession(current ?? null);
           setIsBridgeReady(true);
-          setStatusMessage(
-            "프로필 촬영을 진행해주세요",
-          );
+          setStatusMessage("프로필 촬영을 진행해주세요");
           setCaptureCountdown(null);
         }
       } catch (error) {
@@ -196,9 +222,8 @@ export const useProfileSession = () => {
 
     try {
       const credentials = toCredentials(activeSession);
-      const status = await bridgeClient.getCaptureStatus(
-        credentials,
-      );
+      const status = await bridgeClient.getCaptureStatus(credentials);
+      if (status.captureSerial > 0) setCaptureFlashId(status.captureSerial);
 
       if (status.state === "COMPLETE") {
         await refreshSession(activeSession);
@@ -217,12 +242,19 @@ export const useProfileSession = () => {
       }
 
       setStatusMessage(formatCaptureStatusMessage(status));
-      setCaptureCountdown(
-        Number.isFinite(status.remainingMs)
-          ? Math.max(1, Math.ceil(status.remainingMs / 1000))
-          : null,
-      );
-      pollTimer.current = setTimeout(() => pollCapture(activeSession), 500);
+      if (
+        Number.isFinite(status.countdownEndsAt) &&
+        !status.previewCountdownEmbedded
+      ) {
+        setCountdownDeadline(status.countdownEndsAt);
+      } else
+        setCaptureCountdown(
+          !status.previewCountdownEmbedded &&
+            Number.isFinite(status.remainingMs)
+            ? Math.max(1, Math.ceil(status.remainingMs / 1000))
+            : null,
+        );
+      pollTimer.current = setTimeout(() => pollCapture(activeSession), 100);
     } catch (error) {
       logSessionError("Capture status polling failed", error);
       setStatusMessage("촬영 상태를 확인하지 못했습니다");
@@ -234,6 +266,7 @@ export const useProfileSession = () => {
   const startCapture = async () => {
     if (!isBridgeReady || isBusy) return;
     setIsBusy(true);
+    setCaptureFlashId(0);
     setCaptureCountdown(null);
     setStatusMessage("카메라를 준비하는 중");
 
@@ -272,7 +305,7 @@ export const useProfileSession = () => {
       setSession(nextSession);
       setStatusMessage(formatCaptureStatusMessage(nextSession.capture));
       setCaptureCountdown(null);
-      pollTimer.current = setTimeout(() => pollCapture(nextSession), 500);
+      pollTimer.current = setTimeout(() => pollCapture(nextSession), 100);
     } catch (error) {
       logSessionError("Capture start failed", error);
       setStatusMessage("촬영을 시작하지 못했습니다. 다시 시도해주세요");
@@ -320,6 +353,8 @@ export const useProfileSession = () => {
           "ACTIVE_PROFILE",
         ].includes(session.state)),
     captureCountdown,
+    captureFlashId,
+    captureProgress,
     finalize,
     isBusy,
     isCaptureComplete: isProfileFinalizable(session),

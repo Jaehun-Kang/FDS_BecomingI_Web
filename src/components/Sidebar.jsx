@@ -2,6 +2,7 @@ import iconLogo from "../assets/icons/logo_2.svg";
 import iconHomeO from "../assets/icons/home_outline.svg";
 import iconHomeS from "../assets/icons/home_solid.svg";
 import iconProfile from "../assets/icons/profile.svg";
+import iconLogout from "../assets/icons/logout.svg";
 import { useLocation, useNavigate } from "react-router-dom";
 import {
   clearCurrentAudience,
@@ -110,7 +111,6 @@ function Sidebar({ inactivityRemainingSeconds }) {
               <img
                 src={currentAudience?.profileImage ?? iconProfile}
                 alt="Profile"
-                style={{ height: "100%", objectFit: "cover", width: "100%" }}
               />
             </div>
             <div className="nav--section--btn--text">프로필</div>
@@ -124,9 +124,12 @@ function Sidebar({ inactivityRemainingSeconds }) {
           type="button"
           onClick={returnToStart}
         >
-          {shouldShowReturnCountdown
-            ? `${inactivityRemainingSeconds}초 후 처음으로`
-            : "처음으로"}
+          <img src={iconLogout} alt="" aria-hidden="true" />
+          <span>
+            {shouldShowReturnCountdown
+              ? `${inactivityRemainingSeconds}초 후 처음으로`
+              : "처음으로"}
+          </span>
         </button>
       )}
     </>

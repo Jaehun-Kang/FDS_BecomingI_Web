@@ -1,3 +1,5 @@
+import { recordBridgeTiming } from "../experiments/performanceLog.js";
+
 export class BridgeApiError extends Error {
   constructor(status, error) {
     super(error?.message ?? `Bridge request failed with status ${status}`);
@@ -43,6 +45,7 @@ export class BridgeClient {
         const log = JSON.parse(event.data);
         const method = log.level === "error" ? "error" : log.level === "warn" ? "warn" : "info";
         const [message = "[BIB] Log", ...args] = log.args ?? [];
+        recordBridgeTiming(message, args);
         console[method](message, ...args);
       } catch (error) {
         console.warn("[BI] BIB log forwarding failed", error);

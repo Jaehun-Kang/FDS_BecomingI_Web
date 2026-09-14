@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { isTransitionVisible } from "../services/transitionVisibility.js";
+import { logProfileTiming, createPlaybackContext } from "../experiments/performanceLog.js";
 import iconPostsO from "../assets/icons/posts_outline.svg";
 import iconPostsS from "../assets/icons/posts_solid.svg";
 import iconPostsTaggedO from "../assets/icons/posts_tagged_outline.svg";
@@ -11,7 +13,13 @@ import { useProfileTransforms } from "../hooks/useProfileTransforms.js";
 import { useNavigate } from "react-router-dom";
 import { getCurrentAudience } from "../utils/audienceStore.js";
 import { socialStore } from "../services/socialStore.js";
+import { getTaggedPosts, getPostTransformAssetId, updatePostLike, lockPageScroll } from "../services/postInteractions.js";
 import { createTransitionQueue } from "../services/transitionQueue.js";
+import { createPreparationCache } from "../services/preparationCache.js";
+import { getCanvasBackingGeometry } from "../services/canvasGeometry.js";
+import { getPostOverlayRatio, getPostOverlayWidth } from "../services/postOverlayGeometry.js";
+import { createProfileWorkers } from "../services/profileWorkers.js";
+import { getResultGrid } from "../experiments/transformSettings.js";
 
 const profileAssetUrls = import.meta.glob("../assets/**/*", {
   eager: true,
@@ -19,9 +27,6 @@ const profileAssetUrls = import.meta.glob("../assets/**/*", {
   query: "?url",
 });
 const postFrameCount = 80;
-const postOverlayVerticalGap = 48;
-const postOverlayHorizontalGap = 40;
-const postOverlayCommentWidth = 500;
 
 const resolveAssetUrl = (path) => profileAssetUrls[path] ?? path;
 
@@ -74,14 +79,6 @@ const getRelativePostTimestamp = (timestamp) => {
   return `${Math.floor(elapsedDays / 7)}주`;
 };
 
-const getPostOverlayImageWidth = (imageRatio) => {
-  const maxImageHeight = window.innerHeight - postOverlayVerticalGap;
-  const maxImageWidth =
-    window.innerWidth - postOverlayHorizontalGap - postOverlayCommentWidth;
-  const imageWidth = imageRatio * maxImageHeight;
-
-  return `${Math.max(0, Math.min(imageWidth, maxImageWidth))}px`;
-};
 
 const avatarImageStyle = {
   height: "100%",
@@ -385,13 +382,11 @@ const getDisplayedImageMetrics = (
   const paddingBottom = parseCssPixelValue(computedStyle.paddingBottom);
   const renderWidth = Math.max(
     1,
-    Math.round(rect.width || imageElement.clientWidth || fallbackDisplayWidth),
+    rect.width || imageElement.clientWidth || fallbackDisplayWidth,
   );
   const renderHeight = Math.max(
     1,
-    Math.round(
-      rect.height || imageElement.clientHeight || fallbackDisplayHeight,
-    ),
+    rect.height || imageElement.clientHeight || fallbackDisplayHeight,
   );
   const contentWidth = Math.max(
     1,
@@ -485,29 +480,29 @@ const cropImage = (image, box) => {
   return canvas;
 };
 
-const imageRgb = (canvas, aspect) => {
+const imageRgb = (canvas, aspect, gridWidth = profileTransitionSidelen, gridHeight = gridWidth) => {
   const output = new OffscreenCanvas(
-    profileTransitionSidelen,
-    profileTransitionSidelen,
+    gridWidth,
+    gridHeight,
   );
   const context = output.getContext("2d");
   drawImageCoverForAspect(
     context,
     canvas,
-    profileTransitionSidelen,
-    profileTransitionSidelen,
+    gridWidth,
+    gridHeight,
     aspect,
   );
   const rgba = context.getImageData(
     0,
     0,
-    profileTransitionSidelen,
-    profileTransitionSidelen,
+    gridWidth,
+    gridHeight,
   ).data;
   const rgb = new Uint8Array(
-    profileTransitionSidelen * profileTransitionSidelen * 3,
+    gridWidth * gridHeight * 3,
   );
-  for (let index = 0; index < profileTransitionSidelen ** 2; index += 1) {
+  for (let index = 0; index < gridWidth * gridHeight; index += 1) {
     rgb[index * 3] = rgba[index * 4];
     rgb[index * 3 + 1] = rgba[index * 4 + 1];
     rgb[index * 3 + 2] = rgba[index * 4 + 2];
@@ -515,27 +510,27 @@ const imageRgb = (canvas, aspect) => {
   return rgb;
 };
 
-const imageGray = (image, aspect) => {
+const imageGray = (image, aspect, gridWidth = profileTransitionSidelen, gridHeight = gridWidth) => {
   const canvas = new OffscreenCanvas(
-    profileTransitionSidelen,
-    profileTransitionSidelen,
+    gridWidth,
+    gridHeight,
   );
   const context = canvas.getContext("2d");
   drawImageCoverForAspect(
     context,
     image,
-    profileTransitionSidelen,
-    profileTransitionSidelen,
+    gridWidth,
+    gridHeight,
     aspect,
   );
   const rgba = context.getImageData(
     0,
     0,
-    profileTransitionSidelen,
-    profileTransitionSidelen,
+    gridWidth,
+    gridHeight,
   ).data;
   return Uint8Array.from(
-    { length: profileTransitionSidelen ** 2 },
+    { length: gridWidth * gridHeight },
     (_, index) => rgba[index * 4],
   );
 };
@@ -559,6 +554,7 @@ const buildMaskedFaceSourceRgba = (
   processingSidelen,
   aspect,
   targetMaskCanvas,
+  gridHeight = processingSidelen,
 ) => {
   const sourceCanvas = new OffscreenCanvas(renderW, renderH);
   const sourceContext = sourceCanvas.getContext("2d");
@@ -581,24 +577,25 @@ const buildMaskedFaceSourceRgba = (
   sourceContext.drawImage(targetMaskCanvas, 0, 0, renderW, renderH);
   sourceContext.globalCompositeOperation = "source-over";
 
-  const output = new OffscreenCanvas(processingSidelen, processingSidelen);
+  const output = new OffscreenCanvas(processingSidelen, gridHeight);
   const context = output.getContext("2d");
   drawImageCoverForAspect(
     context,
     sourceCanvas,
     processingSidelen,
-    processingSidelen,
+    gridHeight,
     aspect,
   );
   return new Uint8Array(
-    context.getImageData(0, 0, processingSidelen, processingSidelen).data.buffer,
+    context.getImageData(0, 0, processingSidelen, gridHeight).data.buffer,
   );
 };
 
-let profileWorkerPromise;
-const getProfileTransitionWorker = () => {
-  profileWorkerPromise ??= (async () => {
-    const worker = new Worker("/v2/resources/transform/obamify-worker.js?v=profile-transition-7");
+const profileWorkers = createProfileWorkers({
+  createWorker: (role) => new Worker("/v2/resources/transform/obamify-worker.js?v=profile-transition-11", {
+    name: "bi-profile-" + role,
+  }),
+  loadResources: async () => {
     const [wasmJsSource, wasmBytes, weightsImage, seed, jfa, shade] =
       await Promise.all([
         fetch("/v2/resources/transform/pkg/obamify_wasm.js").then((response) =>
@@ -619,32 +616,19 @@ const getProfileTransitionWorker = () => {
         ),
       ]);
 
-    await new Promise((resolve, reject) => {
-      const onMessage = (event) => {
-        if (event.data.type === "READY") {
-          worker.removeEventListener("message", onMessage);
-          resolve();
-        } else if (event.data.type === "ERROR") {
-          reject(new Error(event.data.error));
-        }
-      };
-
-      worker.addEventListener("message", onMessage);
-      worker.postMessage({
-        type: "INIT",
+    return {
+      weightsImage,
+      init: {
         wasmJsSource,
         wasmBytes,
         targetRgb: new Uint8Array(profileTransitionSidelen ** 2 * 3),
         weightsGray: new Uint8Array(profileTransitionSidelen ** 2),
         shaderSources: { seed, jfa, shade },
-      });
-    });
-
-    return { worker, weightsImage };
-  })();
-
-  return profileWorkerPromise;
-};
+      },
+    };
+  },
+});
+const getProfileTransitionWorker = () => profileWorkers.get("animation");
 
 let nextProfileTransitionJobId = 1;
 const completedProfileTransitionCache = new Set();
@@ -655,22 +639,41 @@ const markProfileTransitionComplete = (baseSrc, src) => {
     completedProfileTransitionCache.add(getProfileTransitionKey(baseSrc, src));
   }
 };
-const enqueueProfileTransition = createTransitionQueue(2);
+const enqueueProfileTransition = createTransitionQueue(4);
 const enqueueProfilePreparation = createTransitionQueue(1);
+const getPreparedProfile = createPreparationCache();
 
-const prepareProfilePixelTransition = async ({ baseSrc, src, faceBox }) => {
+const prepareProfilePixelTransition = async ({ baseSrc, src, faceBox, assetId, timingContext }) => {
+  const startedAt = performance.now();
+  getProfileTransitionWorker().catch((error) => {
+    console.warn("[BI] Profile animation worker warmup failed", error);
+  });
   const [{ worker, weightsImage }, fromImage, toImage] = await Promise.all([
-    getProfileTransitionWorker(), loadCanvasImage(baseSrc), loadCanvasImage(src),
+    profileWorkers.get("compute"), loadCanvasImage(baseSrc), loadCanvasImage(src),
   ]);
+  const decodedAt = performance.now();
   const box = getPixelBox(faceBox, fromImage.naturalWidth, fromImage.naturalHeight);
   const aspect = box.width / box.height;
+  const { sidelen, gridWidth, gridHeight } = getResultGrid(src, box.width, box.height);
   const targetCrop = cropImage(toImage, box);
   const sourceRgba = buildMaskedFaceSourceRgba(fromImage, box, box.width, box.height,
-    profileTransitionSidelen, aspect, targetCrop);
+    gridWidth, aspect, targetCrop, gridHeight);
   if (!sourceRgba) throw new Error("Profile masked source canvas unavailable");
-  const targetRgb = imageRgb(targetCrop, aspect);
-  const weightsGray = imageGray(weightsImage, aspect);
+  const targetRgb = imageRgb(targetCrop, aspect, gridWidth, gridHeight);
+  const weightsGray = imageGray(weightsImage, aspect, gridWidth, gridHeight);
   const imgId = nextProfileTransitionJobId++;
+  const preparedAt = performance.now();
+  const computeStartedAt = performance.now();
+  const logPreparation = (workerPerf, workerRoundTripMs) => logProfileTiming("[BI] Profile preparation timing", {
+    ...timingContext, assetId, imgId,
+    decodeAndWorkerMs: decodedAt - startedAt,
+    inputPreparationMs: preparedAt - decodedAt,
+    cacheStatus: "disabled",
+    cacheLookupMs: 0,
+    workerRoundTripMs,
+    totalMs: performance.now() - startedAt,
+    worker: workerPerf,
+  });
   const assignments = await new Promise((resolve, reject) => {
     const cleanup = () => {
       clearTimeout(timer);
@@ -679,6 +682,7 @@ const prepareProfilePixelTransition = async ({ baseSrc, src, faceBox }) => {
     const onMessage = (event) => {
       if (event.data.imgId !== imgId) return;
       if (event.data.type === "COMPUTE_DONE") {
+        logPreparation(event.data.perf, performance.now() - computeStartedAt);
         cleanup();
         resolve(event.data.assignments);
       } else if (event.data.type === "ERROR") {
@@ -692,26 +696,19 @@ const prepareProfilePixelTransition = async ({ baseSrc, src, faceBox }) => {
     }, 120000);
     worker.addEventListener("message", onMessage);
     worker.postMessage({ type: "PROCESS", imgId, prepareOnly: true,
-      sourceType: "img", sidelen: profileTransitionSidelen,
+      sourceType: "img", sidelen, gridWidth, gridHeight,
       srcRgba: sourceRgba.buffer, targetRgb: targetRgb.buffer, weightsGray: weightsGray.buffer });
   });
-  return { assignments, sourceRgba, targetRgb, weightsGray };
+  return { assignments, sourceRgba, targetRgb, weightsGray, sidelen, gridWidth, gridHeight };
 };
 
-const isElementFullyInViewport = (element) => {
-  const rect = element.getBoundingClientRect();
+const isElementReadyForTransition = (element) => {
   const viewportWidth =
     window.innerWidth || document.documentElement.clientWidth || 0;
   const viewportHeight =
     window.innerHeight || document.documentElement.clientHeight || 0;
 
-  return (
-    element.isConnected && rect.width > 0 && rect.height > 0 &&
-    rect.top >= 0 &&
-    rect.left >= 0 &&
-    rect.bottom <= viewportHeight &&
-    rect.right <= viewportWidth
-  );
+  return isTransitionVisible(element, viewportWidth, viewportHeight);
 };
 
 const getElementViewportRatio = (element) => {
@@ -734,6 +731,8 @@ const getElementViewportRatio = (element) => {
 };
 
 const runProfilePixelTransition = async ({
+  timingContext,
+  assetId,
   baseSrc,
   container,
   faceBox,
@@ -782,11 +781,8 @@ const runProfilePixelTransition = async ({
       ),
     ),
   );
-  const renderWidth = Math.max(1, Math.round(displayRenderWidth * backingScale));
-  const renderHeight = Math.max(
-    1,
-    Math.round(displayRenderHeight * backingScale),
-  );
+  const { renderWidth, renderHeight, scaleX: backingScaleX, scaleY: backingScaleY } =
+    getCanvasBackingGeometry(displayRenderWidth, displayRenderHeight, backingScale);
   const sourceRgba = prepared?.sourceRgba ?? buildMaskedFaceSourceRgba(
     fromImage,
     sourceBox,
@@ -802,10 +798,10 @@ const runProfilePixelTransition = async ({
   const renderSrcRgba = buildPreviewPremultipliedRgba(sourceRgba);
   const targetRgb = prepared?.targetRgb ?? imageRgb(targetCrop, aspect);
   const weightsGray = prepared?.weightsGray ?? imageGray(weightsImage, aspect);
-  const viewportX = displayMetrics.faceX * backingScale;
-  const viewportY = displayMetrics.faceY * backingScale;
-  const viewportW = Math.max(1, displayMetrics.faceWidth * backingScale);
-  const viewportH = Math.max(1, displayMetrics.faceHeight * backingScale);
+  const viewportX = displayMetrics.faceX * backingScaleX;
+  const viewportY = displayMetrics.faceY * backingScaleY;
+  const viewportW = Math.max(1, displayMetrics.faceWidth * backingScaleX);
+  const viewportH = Math.max(1, displayMetrics.faceHeight * backingScaleY);
   const canvas = document.createElement("canvas");
   canvas.width = renderWidth;
   canvas.height = renderHeight;
@@ -826,6 +822,8 @@ const runProfilePixelTransition = async ({
     renderWidth,
     renderHeight,
     backingScale,
+    backingScaleX,
+    backingScaleY,
     viewportX,
     viewportY,
     viewportW,
@@ -838,10 +836,10 @@ const runProfilePixelTransition = async ({
   const maskContext = maskCanvas.getContext("2d");
   maskContext.fillStyle = "white";
   const coverMetrics = {
-    x: displayMetrics.drawLeft * backingScale,
-    y: displayMetrics.drawTop * backingScale,
-    width: fromImage.naturalWidth * displayMetrics.scaleX * backingScale,
-    height: fromImage.naturalHeight * displayMetrics.scaleY * backingScale,
+    x: displayMetrics.drawLeft * backingScaleX,
+    y: displayMetrics.drawTop * backingScaleY,
+    width: fromImage.naturalWidth * displayMetrics.scaleX * backingScaleX,
+    height: fromImage.naturalHeight * displayMetrics.scaleY * backingScaleY,
   };
   drawLandmarkFaceMask({
     context: maskContext,
@@ -866,20 +864,33 @@ const runProfilePixelTransition = async ({
 
   const offscreen = canvas.transferControlToOffscreen();
   const imgId = nextProfileTransitionJobId++;
+  const playbackRequestedAt = performance.now();
 
   return new Promise((resolve, reject) => {
     const onMessage = (event) => {
       if (event.data.imgId !== imgId) return;
 
       if (event.data.type === "FIRST_FRAME") {
-        onFirstFrame?.();
+        logProfileTiming("[BI] Profile first frame timing", {
+          ...timingContext,
+          assetId,
+          imgId,
+          playbackToFirstFrameMs: performance.now() - playbackRequestedAt,
+          worker: event.data.perf,
+        });
         canvas.style.visibility = "visible";
+        onFirstFrame?.();
+      }
+
+      if (event.data.type === "PERF_SUMMARY") {
+        logProfileTiming("[BI] Profile animation timing", { ...timingContext, assetId, imgId, ...event.data.perf });
       }
 
       if (event.data.type === "ANIMATION_DONE") {
         worker.removeEventListener("message", onMessage);
-        console.info("[BI] Profile pixel transition complete");
+        logProfileTiming("[BI] Profile pixel transition complete", { ...timingContext, assetId, imgId, finishReason: event.data.finishReason });
         resolve({
+          finishReason: event.data.finishReason ?? "worker-completed-unspecified",
           cleanup: () => {
             canvas.style.opacity = "0";
             window.setTimeout(() => canvas.remove(), 160);
@@ -904,6 +915,7 @@ const runProfilePixelTransition = async ({
         exportFinalImage: false,
         assignments: prepared?.assignments,
         sidelen: profileTransitionSidelen,
+        ...(prepared ? { sidelen: prepared.sidelen, gridWidth: prepared.gridWidth, gridHeight: prepared.gridHeight } : {}),
         srcRgba: sourceRgba.buffer,
         renderSrcRgba: renderSrcRgba.buffer,
         targetRgb: targetRgb.buffer,
@@ -919,10 +931,6 @@ const runProfilePixelTransition = async ({
         offscreen,
       },
       [
-        sourceRgba.buffer,
-        renderSrcRgba.buffer,
-        targetRgb.buffer,
-        weightsGray.buffer,
         offscreen,
       ],
     );
@@ -942,7 +950,6 @@ function ProfileTransformAvatar({
   replayTransition = false,
   src,
   style,
-  transitionVersion = 0,
 }) {
   const containerRef = useRef(null);
   const imageRef = useRef(null);
@@ -950,6 +957,7 @@ function ProfileTransformAvatar({
   const faceBoxRef = useRef(faceBox);
   const faceLandmarksRef = useRef(faceLandmarks);
   const transformedImageRef = useRef(null);
+  const replayTransitionRef = useRef(replayTransition);
   const initialTransitionKey = getProfileTransitionKey(baseSrc, src);
   const initialHasCompletedTransition =
     !replayTransition &&
@@ -960,7 +968,7 @@ function ProfileTransformAvatar({
     initialHasCompletedTransition ? src : null,
   );
   const [showTransformedImage, setShowTransformedImage] = useState(
-    Boolean(initialHasCompletedTransition),
+    false,
   );
 
   useEffect(() => {
@@ -972,7 +980,8 @@ function ProfileTransformAvatar({
   useEffect(() => {
     faceBoxRef.current = faceBox;
     faceLandmarksRef.current = faceLandmarks;
-  }, [faceBox, faceLandmarks]);
+    replayTransitionRef.current = replayTransition;
+  }, [faceBox, faceLandmarks, replayTransition]);
 
   useEffect(() => {
     if (!assetId || !onVisibleAsset) return undefined;
@@ -991,6 +1000,7 @@ function ProfileTransformAvatar({
     const transitionKey = getProfileTransitionKey(baseSrc, src);
     const activeFaceBox = faceBoxRef.current;
     const activeFaceLandmarks = faceLandmarksRef.current;
+    const prioritizePlayback = replayTransitionRef.current;
 
     if (
       !container ||
@@ -1003,11 +1013,16 @@ function ProfileTransformAvatar({
       return undefined;
     }
 
-    if (!replayTransition && completedProfileTransitionCache.has(transitionKey)) {
+    if (completedProfileTransitionCache.has(transitionKey)) {
       transitionKeyRef.current = transitionKey;
       setCommittedSrc(src);
-      setShowTransformedImage(true);
-      return undefined;
+      let active = true;
+      transformedImageRef.current.decode().then(() => {
+        if (active) setShowTransformedImage(true);
+      }).catch(() => {
+        // A missing cached blob must never hide the original.
+      });
+      return () => { active = false; };
     }
 
     if (transitionKeyRef.current === transitionKey) {
@@ -1017,66 +1032,96 @@ function ProfileTransformAvatar({
     let cancelled = false;
     const controller = new AbortController();
     let cleanupOverlay = null;
+    let stage = "preparing";
+    const timingContext = createPlaybackContext(src);
+    let finished = false;
+    const lifecycleStartedAt = performance.now();
+    const finish = (finishReason) => {
+      if (finished) return;
+      finished = true;
+      logProfileTiming("[BI] Profile playback ended", {
+        ...timingContext,
+        assetId, stage, finishReason, totalMs: performance.now() - lifecycleStartedAt,
+      });
+    };
     transitionKeyRef.current = transitionKey;
 
     const render = async () => {
       const visibilityTarget =
         container.closest(".profile--posts--frames--frame") ?? container;
-      const transformedImage = transformedImageRef.current;
-      if (transformedImage?.decode) {
-        await transformedImage.decode();
-      }
       if (cancelled) return null;
-      const prepared = await enqueueProfilePreparation(
-        () => prepareProfilePixelTransition({ baseSrc, src, faceBox: activeFaceBox }),
-        { signal: controller.signal, ready: () => {
+      const preparationKey = `${transitionKey}:${JSON.stringify(activeFaceBox)}`;
+      const prepared = await (getPreparedProfile.peek(preparationKey) || enqueueProfilePreparation(
+        () => getPreparedProfile(preparationKey,
+          () => prepareProfilePixelTransition({ baseSrc, src, faceBox: activeFaceBox, assetId, timingContext })),
+        { signal: controller.signal, priority: prioritizePlayback ? 1 : 0, ready: () => {
           if (!visibilityTarget.isConnected) return false;
           const rect = visibilityTarget.getBoundingClientRect();
           return rect.width > 0 && rect.height > 0 && rect.bottom > 0 &&
             rect.top <= window.innerHeight + rect.height && rect.right > 0 && rect.left < window.innerWidth;
         } },
-      );
+      ));
       if (cancelled || !prepared) return null;
+      stage = "waiting-for-viewport-and-capacity";
       return enqueueProfileTransition(async () => {
         if (cancelled) return null;
+        await transformedImageRef.current?.decode();
+        if (cancelled) return null;
         console.info("[BI] Profile pixel transition viewport ready");
+        stage = "playing";
         setCommittedSrc(src);
         return runProfilePixelTransition({
+          timingContext,
+          assetId,
           baseSrc,
           container,
           faceBox: activeFaceBox,
           faceLandmarks: activeFaceLandmarks,
           imageElement,
-          onFirstFrame: () => {
-            if (!cancelled) setShowTransformedImage(true);
-          },
           src,
           prepared,
         });
-      }, { ready: () => isElementFullyInViewport(visibilityTarget), signal: controller.signal });
+      }, { ready: () => isElementReadyForTransition(visibilityTarget), signal: controller.signal,
+        priority: prioritizePlayback ? 1 : 0 });
     };
 
     render()
       .then(async (result) => {
         cleanupOverlay = result?.cleanup || null;
         if (cancelled) { cleanupOverlay?.(); return; }
-        if (!result) return;
+        if (!result) { finish("not-started"); return; }
+        stage = "handoff-to-blob";
+        await transformedImageRef.current?.decode();
+        if (cancelled) return;
         markProfileTransitionComplete(baseSrc, src);
         setShowTransformedImage(true);
         await new Promise((resolve) => requestAnimationFrame(resolve));
         await new Promise((resolve) => requestAnimationFrame(resolve));
-        if (!cancelled) cleanupOverlay?.();
+        if (!cancelled) {
+          finish(result.finishReason);
+          cleanupOverlay?.();
+        }
       })
-      .catch((error) => {
+      .catch(async (error) => {
         if (cancelled) return;
+        finish("failed");
         console.warn("[BI] Profile canvas transition failed", error);
-        setCommittedSrc(src);
-        setShowTransformedImage(true);
+        try {
+          await transformedImageRef.current?.decode();
+          if (!cancelled) {
+            setCommittedSrc(src);
+            setShowTransformedImage(true);
+          }
+        } catch {
+          // Keep the original visible when the result image cannot be decoded.
+        }
       });
 
     return () => {
+      finish("view-disposed-or-source-changed");
       cancelled = true;
       controller.abort();
+      if (transitionKeyRef.current === transitionKey) transitionKeyRef.current = null;
       cleanupOverlay?.();
       try {
         container
@@ -1086,7 +1131,9 @@ function ProfileTransformAvatar({
         // The transition canvas is best-effort visual state.
       }
     };
-  }, [baseSrc, replayTransition, src, transitionVersion]);
+    // Playback options can change when another view finishes this asset.
+    // Only a different image or unmount may interrupt this canvas.
+  }, [baseSrc, src]);
 
   return (
     <div
@@ -1101,6 +1148,9 @@ function ProfileTransformAvatar({
     >
       <img
         ref={transformedImageRef}
+        onLoad={onLoad}
+        loading="lazy"
+        decoding="async"
         src={committedSrc || src || baseSrc}
         alt=""
         aria-hidden="true"
@@ -1112,11 +1162,13 @@ function ProfileTransformAvatar({
           opacity: committedSrc && showTransformedImage ? 1 : 0,
           position: "absolute",
           width: "100%",
-          zIndex: 1,
+          zIndex: 2,
         }}
       />
       <img
         ref={imageRef}
+        loading="lazy"
+        decoding="async"
         src={baseSrc}
         alt={alt}
         onLoad={onLoad}
@@ -1125,10 +1177,10 @@ function ProfileTransformAvatar({
           inset: 0,
           objectFit: "cover",
           ...imageStyle,
-          opacity: committedSrc && showTransformedImage ? 0 : 1,
+          opacity: 1,
           position: "absolute",
           width: "100%",
-          zIndex: 2,
+          zIndex: 1,
         }}
       />
     </div>
@@ -1150,10 +1202,13 @@ function ProfileTransformFrame({
   src,
   transitionVersion,
 }) {
+  const [measurement, setMeasurement] = useState(null);
+  const measuredRatio = measurement && measurement.source === baseSrc ? measurement.ratio : null;
+  const frameRatio = measuredRatio || (Number.isFinite(aspectRatio) && aspectRatio > 0 ? aspectRatio : 1);
   const fitWidth = className?.includes("fit-width");
   const containFit = imageFit === "contain";
   const frameStyle = {
-    aspectRatio: aspectRatio || undefined,
+    aspectRatio: containFit ? undefined : frameRatio,
     height: containFit || !fitWidth ? "100%" : "auto",
     maxWidth: containFit ? "100%" : "none",
     width: containFit || fitWidth ? "100%" : "auto",
@@ -1172,7 +1227,15 @@ function ProfileTransformFrame({
         objectFit: imageFit,
         width: "100%",
       }}
-      onLoad={onLoad}
+      onLoad={(event) => {
+        const { naturalWidth, naturalHeight } = event.currentTarget;
+        if (naturalWidth > 0 && naturalHeight > 0) {
+          const ratio = naturalWidth / naturalHeight;
+          setMeasurement((current) => current && current.source === baseSrc && current.ratio === ratio
+            ? current : { source: baseSrc, ratio });
+        }
+        onLoad?.(event);
+      }}
       onVisibleAsset={onVisibleAsset}
       replayTransition={replayTransition}
       src={src}
@@ -1187,11 +1250,10 @@ function Profile({
   profileData,
   recommendedProfileData,
   recommendedProfilePath,
-  taggedUsername,
 }) {
   const navigate = useNavigate();
   const [visibleTransformAssetIds, setVisibleTransformAssetIds] = useState([]);
-  const transforms = useProfileTransforms(profileGender, visibleTransformAssetIds);
+  const transforms = useProfileTransforms(getCurrentAudience()?.gender ?? profileGender, visibleTransformAssetIds);
   const transformElements = useRef(new Map());
   const visibilityFrame = useRef(0);
   const refreshTransformVisibility = useCallback(() => {
@@ -1199,7 +1261,7 @@ function Profile({
     visibilityFrame.current = requestAnimationFrame(() => {
       const ranked = [];
       for (const [element, assetId] of transformElements.current) {
-        if (!element.isConnected) continue;
+        if (!element?.isConnected) continue;
         const rect = element.getBoundingClientRect();
         if (!rect.width || !rect.height || rect.right <= 0 || rect.left >= window.innerWidth) continue;
         const visible = getElementViewportRatio(element) > 0;
@@ -1212,6 +1274,7 @@ function Profile({
     });
   }, []);
   const markVisibleTransformAsset = useCallback((assetId, element) => {
+    if (!assetId || !element) return undefined;
     transformElements.current.set(element, assetId);
     refreshTransformVisibility();
     return () => {
@@ -1243,7 +1306,7 @@ function Profile({
   const profileAssetId = getProfileAssetId(profileGender);
   const profileAsset = canUseProfileTransforms
     ? transforms.jobs.find(
-        (job) => job.assetId === profileAssetId || job.role === "profile-avatar",
+        (job) => job.assetId === profileAssetId,
       )
     : null;
   const profileUser = {
@@ -1270,14 +1333,11 @@ function Profile({
   const profilePosts = [...profileData.posts]
     .sort((firstPost, secondPost) => secondPost.timestamp - firstPost.timestamp)
     .map((post, index) => {
+      const transformAssetId = getPostTransformAssetId(post, profileGender, currentAudience?.gender);
       const frameAsset = canUseProfileTransforms
         ? transforms.jobs.find(
             (job) =>
-              job.assetId === post.assetId ||
-              (job.role === "frame" &&
-                (job.postId === post.id ||
-                  job.slot === post.id ||
-                  job.slot === index)),
+              job.assetId === transformAssetId,
           )
         : null;
       const basePostImage = resolveAssetUrl(post.image);
@@ -1286,12 +1346,15 @@ function Profile({
         ...post,
         postIndex: index,
         baseImage: basePostImage,
-        transformAssetId: frameAsset?.assetId ?? post.assetId ?? null,
+        transformAssetId,
         faceBox: frameAsset?.faceBox ?? null,
         faceLandmarks: frameAsset?.faceLandmarks ?? null,
         image: transformedPostImage ?? basePostImage,
         imageAspectRatio: frameAsset?.aspectRatio ?? post.aspectRatio ?? null,
         profileImage: profileUser.profileImage,
+        baseProfileImage,
+        profileFaceBox: profileAsset?.faceBox ?? null,
+        profileFaceLandmarks: profileAsset?.faceLandmarks ?? null,
         transformedImage: transformedPostImage,
         username: profileUser.username,
         caption: post.caption ?? "",
@@ -1304,9 +1367,38 @@ function Profile({
     { length: postFrameCount },
     (_, index) => profilePosts[index] ?? null,
   );
-  const taggedPosts = profilePosts.filter((post) =>
-    post.taggedUsernames.includes(taggedUsername),
-  );
+  const taggedProfileAsset = canUseProfileTransforms
+    ? transforms.jobs.find((job) => job.assetId === getProfileAssetId(recommendedProfileGender))
+    : null;
+  const taggedPosts = getTaggedPosts(recommendedProfileData, profileUsername)
+    .map((post, index) => {
+      const transformAssetId = getPostTransformAssetId(post, recommendedProfileGender, currentAudience?.gender);
+      const asset = canUseProfileTransforms
+        ? transforms.jobs.find((job) => job.assetId === transformAssetId)
+        : null;
+      const baseImage = resolveAssetUrl(post.image);
+      const transformedImage = transforms.urls[asset?.assetId] ?? null;
+      return {
+        ...post,
+        postIndex: profilePosts.length + index,
+        baseImage,
+        image: transformedImage ?? baseImage,
+        transformedImage,
+        transformAssetId,
+        faceBox: asset?.faceBox ?? null,
+        faceLandmarks: asset?.faceLandmarks ?? null,
+        imageAspectRatio: asset?.aspectRatio ?? post.aspectRatio ?? null,
+        username: recommendedUser.username,
+        baseProfileImage: recommendedUser.profileImage,
+        profileImage: transforms.urls[taggedProfileAsset?.assetId] ?? recommendedUser.profileImage,
+        profileFaceBox: taggedProfileAsset?.faceBox ?? null,
+        profileFaceLandmarks: taggedProfileAsset?.faceLandmarks ?? null,
+        caption: post.caption ?? "",
+        commentTimestamp: getRelativePostTimestamp(post.timestamp),
+        displayTimestamp: formatPostTimestamp(post.timestamp),
+      };
+    });
+  const selectablePosts = [...profilePosts, ...taggedPosts];
   const isRecommendedFollowing = socialStore.isFollowingProfile(
     socialState,
     currentAudience,
@@ -1328,24 +1420,19 @@ function Profile({
   };
   const [selectedPostsTab, setSelectedPostsTab] = useState("posts");
   const [selectedPostIndex, setSelectedPostIndex] = useState(null);
+  const [selectedPostHasCompletedTransition, setSelectedPostHasCompletedTransition] = useState(false);
   const [transitionCacheRevision, setTransitionCacheRevision] = useState(0);
   const [poppingLikeIndex, setPoppingLikeIndex] = useState(null);
-  const [postOverlayImageRatio, setPostOverlayImageRatio] = useState(1);
-  const [postOverlayImageWidth, setPostOverlayImageWidth] = useState(
-    `calc(100vh - ${postOverlayVerticalGap}px)`,
-  );
+  const [postOverlayMeasurement, setPostOverlayMeasurement] = useState(null);
+  const [postOverlayViewport, setPostOverlayViewport] = useState(() => ({
+    width: window.innerWidth, height: window.innerHeight,
+  }));
   const selectedPost =
-    selectedPostIndex === null ? null : profilePosts[selectedPostIndex];
-  const selectedPostTransitionKey =
-    selectedPost?.transformedImage
-      ? getProfileTransitionKey(
-          selectedPost.baseImage,
-          selectedPost.transformedImage,
-        )
-      : null;
-  const selectedPostHasCompletedTransition =
-    selectedPostTransitionKey !== null &&
-    completedProfileTransitionCache.has(selectedPostTransitionKey);
+    selectedPostIndex === null ? null : selectablePosts[selectedPostIndex] ?? null;
+  const postOverlayImageWidth = `${getPostOverlayWidth(
+    getPostOverlayRatio(selectedPost, postOverlayMeasurement),
+    postOverlayViewport.width, postOverlayViewport.height,
+  )}px`;
   const selectedPostDataIndex =
     selectedPostIndex === null ? null : selectedPostIndex;
   const isSelectedPostLiked =
@@ -1353,16 +1440,22 @@ function Profile({
     socialStore.hasLikedPost(
       socialState,
       currentAudience,
-      profileUsername,
+      selectedPost.username,
       selectedPost.id,
     );
   const getPostLikeCount = (post) =>
     post.likes +
-    socialStore.getPostLikeDelta(socialState, profileUsername, post.id);
+    socialStore.getPostLikeDelta(socialState, post.username, post.id);
+
+  const isPostOverlayOpen = selectedPost !== null;
+  useEffect(() => {
+    if (!isPostOverlayOpen) return;
+    return lockPageScroll(document);
+  }, [isPostOverlayOpen]);
 
   useEffect(() => {
     const updatePostOverlayImageWidth = () => {
-      setPostOverlayImageWidth(getPostOverlayImageWidth(postOverlayImageRatio));
+      setPostOverlayViewport({ width: window.innerWidth, height: window.innerHeight });
     };
 
     updatePostOverlayImageWidth();
@@ -1371,37 +1464,24 @@ function Profile({
     return () => {
       window.removeEventListener("resize", updatePostOverlayImageWidth);
     };
-  }, [postOverlayImageRatio]);
+  }, []);
 
   const openPostOverlay = (postIndex) => {
-    prioritizeTransformAsset(profilePosts[postIndex]?.transformAssetId);
+    const post = selectablePosts[postIndex];
+    setSelectedPostHasCompletedTransition(Boolean(post?.transformedImage &&
+      completedProfileTransitionCache.has(getProfileTransitionKey(post.baseImage, post.transformedImage))));
+    prioritizeTransformAsset(post?.transformAssetId);
     setSelectedPostIndex(postIndex);
   };
 
-  const toggleSelectedPostLike = () => {
+  const toggleSelectedPostLike = (likeOnly = false) => {
     if (selectedPostDataIndex === null || !selectedPost) {
       return;
     }
 
-    setSocialState((currentSocialState) => {
-      const wasLiked = socialStore.hasLikedPost(
-        currentSocialState,
-        currentAudience,
-        profileUsername,
-        selectedPost.id,
-      );
-      const nextSocialState = socialStore.togglePostLike(
-        currentAudience,
-        profileUsername,
-        selectedPost.id,
-      );
-
-      if (!wasLiked) {
-        setPoppingLikeIndex(selectedPostDataIndex);
-      }
-
-      return nextSocialState;
-    });
+    const result = updatePostLike(socialStore, currentAudience, selectedPost, likeOnly);
+    if (result.added) setPoppingLikeIndex(selectedPostDataIndex);
+    setSocialState(result.state);
   };
 
   const toggleRecommendedFollow = () => {
@@ -1547,10 +1627,7 @@ function Profile({
                       onOpen={openPostOverlay}
                       onVisibleAsset={markVisibleTransformAsset}
                       renderImage={
-                        post.transformedImage &&
-                        post.faceBox &&
-                        Array.isArray(post.faceLandmarks)
-                          ? ({ className, onLoad }) => (
+                        ({ className, onLoad }) => (
                               <ProfileTransformFrame
                                 alt=""
                                 aspectRatio={post.imageAspectRatio}
@@ -1560,12 +1637,10 @@ function Profile({
                                 faceBox={post.faceBox}
                                 faceLandmarks={post.faceLandmarks}
                                 onLoad={onLoad}
-                                onVisibleAsset={markVisibleTransformAsset}
                                 src={post.transformedImage}
                                 transitionVersion={transitionCacheRevision}
                               />
                             )
-                          : null
                       }
                     />
                   ) : (
@@ -1588,10 +1663,7 @@ function Profile({
                     onOpen={openPostOverlay}
                     onVisibleAsset={markVisibleTransformAsset}
                     renderImage={
-                      post.transformedImage &&
-                      post.faceBox &&
-                      Array.isArray(post.faceLandmarks)
-                        ? ({ className, onLoad }) => (
+                      ({ className, onLoad }) => (
                             <ProfileTransformFrame
                               alt=""
                               aspectRatio={post.imageAspectRatio}
@@ -1601,12 +1673,10 @@ function Profile({
                               faceBox={post.faceBox}
                               faceLandmarks={post.faceLandmarks}
                               onLoad={onLoad}
-                              onVisibleAsset={markVisibleTransformAsset}
                               src={post.transformedImage}
                               transitionVersion={transitionCacheRevision}
                             />
                           )
-                        : null
                     }
                   />
                 ))}
@@ -1632,11 +1702,9 @@ function Profile({
               onClick={(event) => event.stopPropagation()}
             >
               <div className="post_overlay--content--img_section">
-                <div className="post_overlay--content--img_section--img">
-                  {selectedPost.transformedImage &&
-                  selectedPost.faceBox &&
-                  Array.isArray(selectedPost.faceLandmarks) ? (
+                <div className="post_overlay--content--img_section--img" onDoubleClick={() => toggleSelectedPostLike(true)}>
                     <ProfileTransformFrame
+                      key={selectedPost.id}
                       alt="게시물 이미지"
                       aspectRatio={selectedPost.imageAspectRatio}
                       assetId={selectedPost.transformAssetId}
@@ -1649,40 +1717,31 @@ function Profile({
                         const { naturalWidth, naturalHeight } =
                           event.currentTarget;
 
-                        setPostOverlayImageRatio(
-                          naturalWidth / naturalHeight || 1,
-                        );
+                        if (naturalWidth > 0 && naturalHeight > 0) {
+                          setPostOverlayMeasurement({
+                            source: selectedPost.baseImage,
+                            ratio: naturalWidth / naturalHeight,
+                          });
+                        }
                       }}
                       onVisibleAsset={markVisibleTransformAsset}
                       replayTransition={!selectedPostHasCompletedTransition}
                       src={selectedPost.transformedImage}
                       transitionVersion={selectedPostIndex}
                     />
-                  ) : (
-                    <img
-                      src={selectedPost.baseImage}
-                      alt="게시물 이미지"
-                      onLoad={(event) => {
-                        const { naturalWidth, naturalHeight } =
-                          event.currentTarget;
-
-                        setPostOverlayImageRatio(
-                          naturalWidth / naturalHeight || 1,
-                        );
-                      }}
-                    />
-                  )}
                 </div>
               </div>
               <div className="post_overlay--content--comment_section">
                 <div className="post_overlay--content--comment_section--profile">
-                  <div className="post_overlay--content--comment_section--profile--img">
-                    <img
-                      src={selectedPost.profileImage}
-                      alt=""
-                      style={avatarImageStyle}
-                    />
-                  </div>
+                  <ProfileTransformAvatar
+                    className="post_overlay--content--comment_section--profile--img"
+                    baseSrc={selectedPost.baseProfileImage}
+                    src={selectedPost.profileImage}
+                    faceBox={selectedPost.profileFaceBox}
+                    faceLandmarks={selectedPost.profileFaceLandmarks}
+                    alt=""
+                    imageStyle={avatarImageStyle}
+                  />
                   <div className="post_overlay--content--comment_section--profile--username">
                     {selectedPost.username}
                   </div>
@@ -1693,13 +1752,15 @@ function Profile({
                   >
                     {selectedPost.caption && (
                       <>
-                        <div className="post_overlay--content--comment_section--comment--main--img">
-                          <img
-                            src={selectedPost.profileImage}
-                            alt=""
-                            style={avatarImageStyle}
-                          />
-                        </div>
+                        <ProfileTransformAvatar
+                          className="post_overlay--content--comment_section--comment--main--img"
+                          baseSrc={selectedPost.baseProfileImage}
+                          src={selectedPost.profileImage}
+                          faceBox={selectedPost.profileFaceBox}
+                          faceLandmarks={selectedPost.profileFaceLandmarks}
+                          alt=""
+                          imageStyle={avatarImageStyle}
+                        />
                         <div className="post_overlay--content--comment_section--comment--main--text">
                           <div className="post_overlay--content--comment_section--comment--main--text--upper">
                             <span className="post_overlay--content--comment_section--comment--main--text--upper--username">
@@ -1722,7 +1783,7 @@ function Profile({
                     className={`post_overlay--content--comment_section--like--btn${isSelectedPostLiked ? " selected" : ""}${poppingLikeIndex === selectedPostDataIndex ? " pop" : ""}`}
                     type="button"
                     aria-pressed={isSelectedPostLiked}
-                    onClick={toggleSelectedPostLike}
+                    onClick={() => toggleSelectedPostLike()}
                     onAnimationEnd={() => setPoppingLikeIndex(null)}
                   >
                     <img src={iconHeartO} alt="" />

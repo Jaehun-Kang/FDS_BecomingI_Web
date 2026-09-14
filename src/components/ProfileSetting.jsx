@@ -4,12 +4,15 @@ import iconProfile from "../assets/icons/profile.svg";
 import iconRefresh from "../assets/icons/refresh.svg";
 import iconCheck from "../assets/icons/check.svg";
 import iconLoading from "../assets/icons/loading.svg";
+import captureSound from "../assets/select.mp3";
+import countdownSound from "../assets/hover.mp3";
 import usernameWords from "../data/usernameWords.json";
 import { saveCurrentAudience } from "../utils/audienceStore.js";
 import convertKoreanToQwerty from "../utils/convertKoreanToQwerty.js";
 import { bridgeClient } from "../services/bridgeClient.js";
 import { socialStore } from "../services/socialStore.js";
 import { useProfileSession } from "../hooks/useProfileSession.js";
+import { useCaptureSound } from "../hooks/useCaptureSound.js";
 
 const genderOptions = [
   { value: "male", label: "남성" },
@@ -71,12 +74,19 @@ function ProfileSetting() {
   const {
     canStartCapture,
     captureCountdown,
+    captureFlashId,
+    captureProgress,
     finalize,
     isBusy,
     isCaptureComplete,
     startCapture,
     statusMessage,
   } = useProfileSession();
+  const prepareCaptureSound = useCaptureSound(captureSound, captureFlashId);
+  const prepareCountdownSound = useCaptureSound(
+    countdownSound,
+    [3, 2, 1].includes(captureCountdown) ? captureCountdown : null,
+  );
   const selectedGenderLabel =
     genderOptions.find((option) => option.value === selectedGender)?.label ??
     "성별";
@@ -107,6 +117,8 @@ function ProfileSetting() {
   saveLoginDataRef.current = saveLoginData;
 
   const handlePrimaryButtonClick = async () => {
+    prepareCaptureSound();
+    prepareCountdownSound();
     autoFinalizeStartedRef.current = false;
     setAutoFinalizeMessage("");
     setPreviewUrl("");
@@ -177,6 +189,14 @@ function ProfileSetting() {
     <main>
       <div className="profile_setting">
         <div className="profile_setting--profile">
+          <div className="profile_setting--profile--capture">
+            {captureProgress !== null && (
+              <div
+                className="profile_setting--profile--capture--ring"
+                aria-hidden="true"
+                style={{ "--capture-progress": captureProgress }}
+              />
+            )}
           <div className="profile_setting--profile--img">
             <img
               className={previewUrl ? "is-live" : ""}
@@ -187,23 +207,14 @@ function ProfileSetting() {
               <div
                 className="profile_setting--profile--img--countdown"
                 aria-live="polite"
-                style={{
-                  alignItems: "center",
-                  color: "rgba(255, 255, 255, 0.82)",
-                  display: "flex",
-                  fontSize: "clamp(96px, 16vw, 168px)",
-                  fontWeight: 800,
-                  inset: 0,
-                  justifyContent: "center",
-                  lineHeight: 1,
-                  pointerEvents: "none",
-                  position: "absolute",
-                  textShadow: "0 2px 24px rgba(0, 0, 0, 0.28)",
-                }}
               >
-                {captureCountdown}
+                <span key={captureCountdown}>{captureCountdown}</span>
               </div>
             )}
+            {captureFlashId > 0 && (
+              <div key={captureFlashId} className="profile_setting--profile--img--flash" aria-hidden="true" />
+            )}
+          </div>
           </div>
           <div className="profile_setting--profile--info">
             <div className="profile_setting--profile--info--box">

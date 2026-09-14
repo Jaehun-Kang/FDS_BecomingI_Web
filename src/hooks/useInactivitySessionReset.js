@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { getAutoReturnEnabled, subscribeExperimentSettings } from "../experiments/transformSettings.js";
 import { bridgeClient } from "../services/bridgeClient.js";
 import { logoutCurrentSession } from "../services/sessionLifecycle.js";
 import { sessionStore } from "../services/sessionStore.js";
@@ -46,6 +47,7 @@ export const useInactivitySessionReset = ({
   const onResetRef = useRef(onReset);
   const deadlineRef = useRef(0);
   const [remainingMs, setRemainingMs] = useState(timeoutMs);
+  const autoReturn = useSyncExternalStore(subscribeExperimentSettings, getAutoReturnEnabled);
 
   useEffect(() => {
     onResetRef.current = onReset;
@@ -53,6 +55,7 @@ export const useInactivitySessionReset = ({
 
   useEffect(() => {
     let timerId = 0;
+    if (!autoReturn) return;
     let countdownTimerId = 0;
     let isResetting = false;
     let lastPointerMoveAt = 0;
@@ -79,7 +82,7 @@ export const useInactivitySessionReset = ({
     };
 
     const handleTimeout = async () => {
-      if (isResetting) return;
+      if (isResetting || !getAutoReturnEnabled()) return;
       isResetting = true;
 
       try {
@@ -119,10 +122,10 @@ export const useInactivitySessionReset = ({
         window.removeEventListener(eventName, handleActivity);
       });
     };
-  }, [timeoutMs]);
+  }, [timeoutMs, autoReturn]);
 
   return {
-    remainingSeconds: Math.max(0, Math.ceil(remainingMs / 1000)),
+    remainingSeconds: autoReturn ? Math.max(0, Math.ceil(remainingMs / 1000)) : Infinity,
     timeoutSeconds: Math.ceil(timeoutMs / 1000),
   };
 };

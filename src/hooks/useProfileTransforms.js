@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { bridgeClient } from "../services/bridgeClient.js";
 import { sessionStore } from "../services/sessionStore.js";
+import { registerTimingContext } from "../experiments/performanceLog.js";
+import { getSessionExperiment, registerResultResolution, waitForExperimentSettings } from "../experiments/transformSettings.js";
 import { createTransformResultCache, getTransformCacheKey, loadReadyTransformResults } from "../services/transformResultCache.js";
 
 const transformReadyStates = new Set(["FINALIZED", "ACTIVE_PROFILE"]);
@@ -132,6 +134,11 @@ export const useProfileTransforms = (profileGender, priorityAssetIds = []) => {
             jobs,
             urls: buildUrlState(credentials, jobs),
           };
+          for (const job of jobs) {
+            registerResultResolution(nextState.urls[job.assetId], job.processingSidelen, job.processingGrid);
+            registerTimingContext(nextState.urls[job.assetId], { sessionId: credentials.sessionId,
+              pipelineVersion: job.pipelineVersion, modelRevision: job.modelRevision });
+          }
           transformStateCache.set(
             getTransformStateCacheKey(credentials, profileGender),
             nextState,
@@ -158,6 +165,7 @@ export const useProfileTransforms = (profileGender, priorityAssetIds = []) => {
           });
           await bridgeClient.scheduleTransforms(credentials, priorityAssetIds, {
             onlyPriority: true,
+            experiment: getSessionExperiment(credentials.sessionId),
           });
         }
         if (
@@ -185,6 +193,8 @@ export const useProfileTransforms = (profileGender, priorityAssetIds = []) => {
     };
 
     const schedule = async () => {
+      await waitForExperimentSettings();
+      if (cancelled) return;
       const bridgeSession = await bridgeClient.getSession(credentials);
       if (cancelled) return;
       logTransformInfo("Profile transform session checked", {
@@ -218,14 +228,17 @@ export const useProfileTransforms = (profileGender, priorityAssetIds = []) => {
         logTransformInfo("Profile transform waiting for visible assets", {
           routeProfileGender: profileGender,
         });
-        await poll();
+        await bridgeClient.scheduleTransforms(credentials, [], {
+          onlyPriority: true, experiment: getSessionExperiment(credentials.sessionId),
+        });
+        if (!cancelled) await poll();
         return;
       }
 
       const jobs = await bridgeClient.scheduleTransforms(
         credentials,
         priorityAssetIds,
-        { onlyPriority: true },
+        { onlyPriority: true, experiment: getSessionExperiment(credentials.sessionId) },
       );
       logTransformInfo("Profile transform scheduled", {
         routeProfileGender: profileGender,
